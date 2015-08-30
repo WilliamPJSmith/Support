@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# paths assume we are running from cellmodeller dir
+cd ~/cellmodeller
+
+# initiate simulation runner with arguments
+RUNNER="Scripts/multi_batch.py"
+MODEL="ex1a_simpleGrowth2D"
+NUM_REPEATS=3
+CONFIG="~/cellmodeller/Config/CMconfig_STARBOARD.cfg"
+
+# call runner inside a screen terminal
+# this means the process will continue to run when we close the ssh connection
+screen cmpython $RUNNER $MODEL $NUM_REPEATS $CONFIG
+
+# when we're done, kill the screen
+exit
+echo "All done."
