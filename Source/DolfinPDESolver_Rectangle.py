@@ -22,6 +22,7 @@ except ImportError:
 import numpy
 import math
 from pyopencl.array import vec
+import time
 
 class RectangleDolfinSolver:
 
@@ -62,9 +63,8 @@ class RectangleDolfinSolver:
 			if hy > max_height:
 				max_height = hy
 		print 'max height is %f' % max_height
-
 		L_y = max_height + self.delta
-	
+
 		# we'll need to extend this to something more general later
 		# also: clear up the file I/O stuff, it's messy!
 		self.SetRectangularMesh(L_y)
@@ -73,15 +73,16 @@ class RectangleDolfinSolver:
 		self.set_bcs()
 		
 		# Use cell centres to evaluate volume occupancy of mesh
-		self.GetVolFracs2D(centers, areas)
+		self.GetVolFracsCrossMesh(centers, areas)
 		
 		# call a solver and save the solution
 		self.NewtonIterator()
 		if stepNum % self.pickleSteps == 0:
 			self.WriteFieldToFile(dir+filename+'.pvd', self.solution)
-
+		
 		# interpolate solution to cell centres
 		u_local = self.InterpolateToCenters2D(centers)
+		
 		return u_local
 		
 	
@@ -121,7 +122,10 @@ class RectangleDolfinSolver:
 		"""
 		Given a disk radius and center, return an unstructured mesh on that dish
 		Uses h as the mesh element size parameter. Center must be a Dolfin Point() instance.
+		/!\ Exports N_y as a global variable
 		"""
+		global N_y
+		
 		mesh_type = self.mesh_type
 		N_y = int(round(L_y/self.h))
 		self.mesh = RectangleMesh(0, 0, self.L_x, L_y, self.N_x, N_y, mesh_type)
@@ -132,8 +136,8 @@ class RectangleDolfinSolver:
 		Initialise boundary conditions on the mesh.
 		/!\ Assumes that the function V is up-to-date
 		"""
-		#dbc = TopDirichletBoundary()
-		dbc = BaseDirichletBoundary()
+		dbc = TopDirichletBoundary()
+		#dbc = BaseDirichletBoundary()
 		self.boundaryCondition = DirichletBC(self.V, Constant(self.u0), dbc)
 
 		
@@ -148,7 +152,9 @@ class RectangleDolfinSolver:
 	
 		for i in range(0,N):
 			for j in range(0,self.mesh.num_cells()):
-				if Cell(self.mesh, j).collides(Point(float(centers[i][0]),float(centers[i][1]),0)):
+				if Cell(self.mesh, j).collides(Point(float(centers[i][0]),\
+													 float(centers[i][1]),\
+													 0)):
 					elements[i] = j
 					break
 		return elements
@@ -171,6 +177,88 @@ class RectangleDolfinSolver:
 		b = Constant(self.K)
 		
 		return -1 * a * u * VolumeFraction() / (b + u)
+		
+		
+	def GetTriangleIndexCrossMesh(self, Point, Origin):
+		"""
+		Given mesh square, assign which triangle a point is in.
+		/!\ Assumes that we're using a crossed rectilinear mesh.
+		/!\ Assumes L_y and N_y are supplied as global variables.
+		"""
+		global L_y, N_y
+		
+		p_x = Point[0]; p_y = Point[1]
+		a_x = Origin[0]; a_y = Origin[1]
+		dx = p_x - a_x
+		dy = p_y - a_y
+		hx = self.L_x / self.N_x
+		hy = L_y / N_y
+		gr = hy / hx; 
+		
+		return 1*(dy-gr*dx>0) + 2*(dy+gr*dx-hy>0);
+
+
+	def GetSquareIndex(self, Point):
+		"""
+		Given mesh dimensions, assign which square a point is in.
+		/!\ Assumes L_y and N_y are supplied as global variables.
+		"""
+		global L_y, N_y
+		
+		p_x = Point[0]; p_y = Point[1]
+		p = int(numpy.floor(p_x*self.N_x / float(self.L_x)))  		# index along x
+		q = int(numpy.floor(p_y*N_y / float(L_y)))   		# index along y
+
+		s = p + q*self.N_x 											# global index of this square
+		sqOrigin = [p*self.L_x / float(self.N_x),\
+					q*L_y / float(N_y)]						# coordinates of this square's origin			    
+		
+		return int(s), sqOrigin 
+
+
+	def GetElementIndexCrossMesh(self, point):
+		"""
+		Get tetrahedron and cube indices and calculate global element index.
+		"""
+		[s, sqOrigin] = self.GetSquareIndex(point)
+		t = self.GetTriangleIndexCrossMesh(point,sqOrigin)
+		
+		return t + 4*s
+
+	
+	def AssignElementsToDataCrossMesh(self, centers):
+		"""
+		Sort cell centres into their respective mesh elements.
+		"""
+		N = centers.shape[0]
+		elements = numpy.zeros((N), numpy.int32)
+		for i in range(0,N):
+			point = centers[i]
+			elements[i] = self.GetElementIndexCrossMesh(point)
+			
+		return elements
+		
+		
+	def GetVolFracsCrossMesh(self, centers, vols):
+		"""
+		Create a global list of the cell volume fractions in mesh elements.
+		Assumes that self.mesh is up to date.
+		'Volumes' are equivalent to areas in 2D.
+		/!\ Exports the array vol_fracs as a global array, for use by VolumeFraction.
+		/!\ Takes 
+		"""
+		global vol_fracs, L_y, N_y
+
+		# assign elements of cells
+		elements = self.AssignElementsToDataCrossMesh(centers)
+		
+		# need to define volume fraction for every element in the mesh
+		# (not just the canonical elements for counting)
+		num_elements = self.mesh.num_cells()
+
+		# sum cell volumes over each element
+		a = (self.L_x*L_y) / (4.0*float(self.N_x)*float(N_y))
+		vol_fracs = numpy.bincount(elements,vols,num_elements) / a
 			
 			
 	def GetVolFracs2D(self, centers, vols):
@@ -178,6 +266,7 @@ class RectangleDolfinSolver:
 		Create a global list of the cell volume fractions in mesh elements.
 		Assumes that self.mesh and self.h are up-to-date.
 		'Volumes' are equivalent to areas in 2D.
+		NOTE: this is pretty slow for >1000 cells, so I've written GetVolFracsCrossMechs as a faster alternative.
 		/!\ Exports the array vol_fracs as a global array, for use by VolumeFraction.
 		"""
 		global vol_fracs
@@ -234,7 +323,8 @@ class RectangleDolfinSolver:
 			areas[cell_no] = thisEl.volume()
 
 		# compute area fractions (should evaluate to 1.0 everywhere)
-		self.GetVolFracs2D(centers, areas)
+		#self.GetVolFracs2D(centers, areas)  # Too slow
+		self.GetVolFracsCrossMesh(centers, areas)
 				
 		# Export a meshfile showing element occupancies
 		G = self.VolumeFractionOnElements()
